@@ -381,11 +381,19 @@ def cmd_capture_test(args) -> None:
                 if args.onnx else StreamingEnhancer(dual_mic=dual, **ref_kw))
     raw_main_hops, raw_ref_hops, enhanced_hops = [], [], []
 
+    native_48k = getattr(args, "native_48k", False)
+    stream_sr = 48000 if native_48k else SAMPLE_RATE
+    stream_hop = HOP * 3 if native_48k else HOP
+
     def cb(indata, _frames, _time_info, status):
         if status:
             print(status, file=sys.stderr)
-        main_hop = indata[:, 0].copy()
-        ref_hop = indata[:, 1].copy() if dual else None
+        main_in = indata[:, 0].copy()
+        ref_in = indata[:, 1].copy() if dual else None
+        
+        main_hop = main_in[::3] if native_48k else main_in
+        ref_hop = ref_in[::3] if (native_48k and ref_in is not None) else ref_in
+        
         raw_main_hops.append(main_hop)
         if ref_hop is not None:
             raw_ref_hops.append(ref_hop)
@@ -400,7 +408,7 @@ def cmd_capture_test(args) -> None:
         time.sleep(1)
     print("  GO -- speak now\n", flush=True)
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, blocksize=HOP, channels=n_channels, dtype="float32",
+    with sd.InputStream(samplerate=stream_sr, blocksize=stream_hop, channels=n_channels, dtype="float32",
                         device=_dev(getattr(args, "input_device", None)), callback=cb):
         sd.sleep(int(args.capture_test * 1000))
     print("done recording.")
@@ -595,7 +603,7 @@ def cmd_live(args) -> None:
 
     # In dual-mic mode we need separate input (2 ch) and output (1 ch) channel
     # counts, so we open an sd.Stream with explicit input/output channels.
-    with sd.Stream(samplerate=SAMPLE_RATE, blocksize=bs,
+    with sd.Stream(samplerate=stream_sr, blocksize=bs,
                    channels=n_in_channels,   # input channels (1 or 2)
                    dtype="float32",
                    device=(dev_in, dev_out) if (dev_in is not None or dev_out is not None) else None,
