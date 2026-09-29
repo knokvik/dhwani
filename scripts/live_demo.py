@@ -9,6 +9,11 @@ Modes:
   --capture-test SEC --out FILE   mic -> file for SEC seconds, no speaker output
   (default, no flags)             mic -> enhance -> speakers, live, 'e' toggles, 'q' quits
 
+Dual INMP441 microphone mode (--dual-mic):
+  Channel 0: Main INMP441 (near the speaker's mouth)
+  Channel 1: Reference INMP441 (captures ambient battlefield noise)
+  The reference channel feeds a spectral-subtraction pre-stage before GTCRN.
+
 Note: this is the pretrained model_trained_on_dns3.tar checkpoint, not yet fine-tuned
 for impulsive defence noise (gunshots/shelling) -- see docs/solution-design.md Stage 1.
 """
@@ -25,7 +30,7 @@ import soundfile as sf
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
-from streaming_engine import HOP, N_FFT, WINDOW, StreamingEnhancer  # noqa: E402
+from streaming_engine import HOP, N_FFT, ONNX_PATH, WINDOW, StreamingEnhancer  # noqa: E402
 
 SAMPLE_RATE = 16000
 GTCRN_DIR = REPO_ROOT / "third_party" / "gtcrn"
@@ -90,8 +95,8 @@ def causal_reference(mix: np.ndarray, checkpoint: str = "model_trained_on_dns3.t
     return out_samples
 
 
-def run_streaming(mix: np.ndarray, enabled: bool = True, onnx_path=None) -> tuple[np.ndarray, float]:
-    enhancer = StreamingEnhancer(onnx_path) if onnx_path else StreamingEnhancer()
+def run_streaming(mix: np.ndarray, enabled: bool = True, onnx_path=None, dual_mic: bool = False) -> tuple[np.ndarray, float]:
+    enhancer = StreamingEnhancer(onnx_path, dual_mic=dual_mic) if onnx_path else StreamingEnhancer(dual_mic=dual_mic)
     n_hops = len(mix) // HOP
     out = np.zeros(n_hops * HOP, dtype=np.float32)
     t0 = time.perf_counter()
@@ -360,19 +365,34 @@ def cmd_capture_test(args) -> None:
     Saving the raw input is the point: an enhanced file on its own proves nothing,
     because a listener has no idea what the microphone actually heard. The pair is
     the evidence.
+
+    In --dual-mic mode, channel 0 is the main INMP441 and channel 1 is the
+    reference INMP441. Both raw channels are saved for comparison.
     """
     import sounddevice as sd
 
-    enhancer = StreamingEnhancer(args.onnx) if args.onnx else StreamingEnhancer()
-    raw_hops, enhanced_hops = [], []
+    dual = getattr(args, "dual_mic", False)
+    n_channels = 2 if dual else 1
+
+    ref_kw = dict(ref_alpha=getattr(args, "ref_alpha", 1.0),
+                  ref_beta=getattr(args, "ref_beta", 0.02),
+                  ref_smoothing=getattr(args, "ref_smoothing", 0.95))
+    enhancer = (StreamingEnhancer(args.onnx, dual_mic=dual, **ref_kw)
+                if args.onnx else StreamingEnhancer(dual_mic=dual, **ref_kw))
+    raw_main_hops, raw_ref_hops, enhanced_hops = [], [], []
 
     def cb(indata, _frames, _time_info, status):
         if status:
             print(status, file=sys.stderr)
-        hop = indata[:, 0].copy()
-        raw_hops.append(hop)
-        enhanced_hops.append(enhancer.process_hop(hop, enabled=True))
+        main_hop = indata[:, 0].copy()
+        ref_hop = indata[:, 1].copy() if dual else None
+        raw_main_hops.append(main_hop)
+        if ref_hop is not None:
+            raw_ref_hops.append(ref_hop)
+        enhanced_hops.append(enhancer.process_hop(main_hop, ref_hop=ref_hop, enabled=True))
 
+    if dual:
+        print("DUAL-MIC MODE: channel 0 = main INMP441, channel 1 = reference INMP441")
     print(f"model: {args.onnx if args.onnx else 'upstream pretrained'}")
     print(f"\nRecording {args.capture_test:.0f}s. Start your noise source now, then speak.")
     for n in (3, 2, 1):
@@ -380,7 +400,7 @@ def cmd_capture_test(args) -> None:
         time.sleep(1)
     print("  GO -- speak now\n", flush=True)
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, blocksize=HOP, channels=1, dtype="float32",
+    with sd.InputStream(samplerate=SAMPLE_RATE, blocksize=HOP, channels=n_channels, dtype="float32",
                         device=_dev(getattr(args, "input_device", None)), callback=cb):
         sd.sleep(int(args.capture_test * 1000))
     print("done recording.")
@@ -388,18 +408,27 @@ def cmd_capture_test(args) -> None:
     if not enhanced_hops:
         sys.exit("nothing captured -- check the input device with: python -c \"import sounddevice;print(sounddevice.query_devices())\"")
 
-    raw = np.concatenate(raw_hops)
+    raw_main = np.concatenate(raw_main_hops)
     enhanced = np.concatenate(enhanced_hops)
 
     out_enh = Path(args.out)
     out_raw = out_enh.with_name(out_enh.stem + "_raw" + out_enh.suffix)
-    sf.write(out_raw, raw, SAMPLE_RATE)
+    sf.write(out_raw, raw_main, SAMPLE_RATE)
     sf.write(out_enh, enhanced, SAMPLE_RATE)
 
-    level = 20 * np.log10(np.sqrt(np.mean(raw**2)) + 1e-9)
-    print(f"\n  BEFORE (what the mic heard):  {out_raw}")
-    print(f"  AFTER  (enhanced):            {out_enh}")
-    print(f"  {len(raw)/SAMPLE_RATE:.1f}s captured, input level {level:.1f} dBFS")
+    level = 20 * np.log10(np.sqrt(np.mean(raw_main**2)) + 1e-9)
+    print(f"\n  BEFORE (what the main mic heard):  {out_raw}")
+    print(f"  AFTER  (enhanced):                  {out_enh}")
+
+    if dual and raw_ref_hops:
+        raw_ref = np.concatenate(raw_ref_hops)
+        out_ref = out_enh.with_name(out_enh.stem + "_ref" + out_enh.suffix)
+        sf.write(out_ref, raw_ref, SAMPLE_RATE)
+        ref_level = 20 * np.log10(np.sqrt(np.mean(raw_ref**2)) + 1e-9)
+        print(f"  REF    (reference mic noise):        {out_ref}")
+        print(f"  ref mic input level {ref_level:.1f} dBFS")
+
+    print(f"  {len(raw_main)/SAMPLE_RATE:.1f}s captured, main mic input level {level:.1f} dBFS")
     if level < -50:
         print("  WARNING: input is very quiet -- check the mic is selected and unmuted.", file=sys.stderr)
     print(f"\nCompare them:\n  aplay {out_raw}\n  aplay {out_enh}")
@@ -454,9 +483,19 @@ def _visual_header() -> None:
 def cmd_live(args) -> None:
     import sounddevice as sd
 
-    enhancer = StreamingEnhancer(args.onnx) if args.onnx else StreamingEnhancer()
+    dual = getattr(args, "dual_mic", False)
+    n_in_channels = 2 if dual else 1
+
+    ref_kw = dict(ref_alpha=getattr(args, "ref_alpha", 1.0),
+                  ref_beta=getattr(args, "ref_beta", 0.02),
+                  ref_smoothing=getattr(args, "ref_smoothing", 0.95))
+    enhancer = (StreamingEnhancer(args.onnx, dual_mic=dual, **ref_kw)
+                if args.onnx else StreamingEnhancer(dual_mic=dual, **ref_kw))
     if args.onnx:
         print(f"model: {args.onnx}")
+    if dual:
+        print("DUAL-MIC MODE: channel 0 = main INMP441, channel 1 = reference INMP441")
+        print("output: BT headphone (mono)")
     state = {"enabled": True, "running": True, "rtf_samples": [], "last_print": time.time(), "noise_pos": 0}
 
     noise_loop = None
@@ -475,29 +514,45 @@ def cmd_live(args) -> None:
         # miss its deadline -- so the model is stepped once per hop inside it
         # rather than assuming one hop per callback.
         for off in range(0, frames, HOP):
-            hop = indata[off : off + HOP, 0].copy()
-            if len(hop) < HOP:
-                hop = np.pad(hop, (0, HOP - len(hop)))
+            main_hop = indata[off : off + HOP, 0].copy()
+            if len(main_hop) < HOP:
+                main_hop = np.pad(main_hop, (0, HOP - len(main_hop)))
+
+            # Reference mic (channel 1) in dual-mic mode.
+            ref_hop = None
+            if dual and indata.shape[1] >= 2:
+                ref_hop = indata[off : off + HOP, 1].copy()
+                if len(ref_hop) < HOP:
+                    ref_hop = np.pad(ref_hop, (0, HOP - len(ref_hop)))
+
             if noise_loop is not None:
                 pos = state["noise_pos"]
                 idx = (np.arange(pos, pos + HOP)) % len(noise_loop)
-                hop = hop + args.noise_gain * noise_loop[idx]
+                main_hop = main_hop + args.noise_gain * noise_loop[idx]
                 state["noise_pos"] = (pos + HOP) % len(noise_loop)
 
             t0 = time.perf_counter()
-            out_hop = enhancer.process_hop(hop, enabled=state["enabled"])
+            out_hop = enhancer.process_hop(main_hop, ref_hop=ref_hop, enabled=state["enabled"])
             state["rtf_samples"].append((time.perf_counter() - t0) / (HOP / SAMPLE_RATE))
             outdata[off : off + HOP, 0] = out_hop[: min(HOP, frames - off)]
             if args.visual:
                 L = enhancer.last
-                state["frame"] = (np.abs(L["spec"]), np.abs(L["spec_out"]), hop, out_hop)
+                state["frame"] = (np.abs(L["spec"]), np.abs(L["spec_out"]), main_hop, out_hop)
 
         now = time.time()
         if not args.visual and now - state["last_print"] > 2.0:
             recent = state["rtf_samples"][-200:]
             mean_rtf = float(np.mean(recent)) if recent else 0.0
             mode = "ENHANCED" if state["enabled"] else "BYPASS "
-            print(f"[{mode}] rolling RTF: {mean_rtf:.3f}")
+            extra = ""
+            if dual:
+                L = enhancer.last
+                if "pre_sub_mag" in L and "post_sub_mag" in L:
+                    reduction_db = 20 * np.log10(
+                        (np.mean(L["pre_sub_mag"]) + 1e-9) /
+                        (np.mean(L["post_sub_mag"]) + 1e-9))
+                    extra = f"  ref-sub: {reduction_db:.1f} dB"
+            print(f"[{mode}] rolling RTF: {mean_rtf:.3f}{extra}")
             state["last_print"] = now
 
     def key_listener():
@@ -519,16 +574,23 @@ def cmd_live(args) -> None:
     listener = threading.Thread(target=key_listener, daemon=True)
     listener.start()
 
-    dev = (_dev(getattr(args, "input_device", None)), _dev(getattr(args, "output_device", None)))
-    if dev != (None, None):
-        print(f"input device:  {dev[0] if dev[0] is not None else 'system default'}")
-        print(f"output device: {dev[1] if dev[1] is not None else 'system default'}")
+    dev_in = _dev(getattr(args, "input_device", None))
+    dev_out = _dev(getattr(args, "output_device", None))
+    if dev_in is not None or dev_out is not None:
+        print(f"input device:  {dev_in if dev_in is not None else 'system default'}")
+        print(f"output device: {dev_out if dev_out is not None else 'system default'}")
     bs = max(HOP, (int(args.blocksize) // HOP) * HOP)
     if bs != HOP:
         print(f"block size {bs} samples ({bs / SAMPLE_RATE * 1000:.0f} ms) -- "
               f"more slack against dropouts, {(bs - HOP) / SAMPLE_RATE * 1000:.0f} ms more latency")
-    with sd.Stream(samplerate=SAMPLE_RATE, blocksize=bs, channels=1, dtype="float32",
-                   device=dev if dev != (None, None) else None, callback=callback):
+
+    # In dual-mic mode we need separate input (2 ch) and output (1 ch) channel
+    # counts, so we open an sd.Stream with explicit input/output channels.
+    with sd.Stream(samplerate=SAMPLE_RATE, blocksize=bs,
+                   channels=n_in_channels,   # input channels (1 or 2)
+                   dtype="float32",
+                   device=(dev_in, dev_out) if (dev_in is not None or dev_out is not None) else None,
+                   callback=callback):
         try:
             if args.visual:
                 _visual_header()
@@ -572,12 +634,26 @@ def main():
                         help="live terminal spectrogram of input vs model output")
     parser.add_argument("--list-devices", action="store_true", help="print audio devices and exit")
     parser.add_argument("--input-device", metavar="ID|NAME", help="mic to capture from")
-    parser.add_argument("--output-device", metavar="ID|NAME", help="where to play the enhanced audio")
+    parser.add_argument("--output-device", metavar="ID|NAME", help="where to play the enhanced audio (e.g. BT headphone)")
     parser.add_argument("--process", metavar="FILE", help="enhance a wav file and exit; needs no audio hardware")
     parser.add_argument("--out", default="capture_test.wav", help="output wav for --capture-test")
     parser.add_argument("--inject-noise", metavar="FILE", help="loop this wav additively into the mic signal (live mode)")
     parser.add_argument("--synthetic-noise", action="store_true", help="inject synthetic pink noise (live mode)")
     parser.add_argument("--noise-gain", type=float, default=0.3, help="linear gain for injected noise")
+    # ---- dual INMP441 microphone options ----
+    parser.add_argument("--dual-mic", action="store_true",
+                        help="dual INMP441 mode: channel 0 = main mic (near mouth), "
+                             "channel 1 = reference mic (ambient noise). The reference "
+                             "mic's spectrum is subtracted from the main before GTCRN.")
+    parser.add_argument("--ref-alpha", type=float, default=1.0,
+                        help="over-subtraction factor for reference noise removal "
+                             "(higher = more aggressive, default 1.0)")
+    parser.add_argument("--ref-beta", type=float, default=0.02,
+                        help="spectral floor as fraction of ref noise estimate "
+                             "(prevents musical noise, default 0.02)")
+    parser.add_argument("--ref-smoothing", type=float, default=0.95,
+                        help="exponential smoothing for ref noise estimate "
+                             "(higher = smoother/slower, default 0.95)")
     args = parser.parse_args()
 
     if args.list_devices:
