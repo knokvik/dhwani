@@ -506,24 +506,29 @@ def cmd_live(args) -> None:
         noise_loop = _synthetic_pink_noise()
         print(f"injecting synthetic pink noise at gain {args.noise_gain}")
 
+    native_48k = getattr(args, "native_48k", False)
+    stream_sr = 48000 if native_48k else SAMPLE_RATE
+    stream_hop = HOP * 3 if native_48k else HOP
+
     def callback(indata, outdata, frames, _time_info, status):
         if status:
             print(status, file=sys.stderr)
-        # The device block may hold several 16 ms hops. A larger block is the fix
-        # for underruns -- the callback is woken less often and has more slack to
-        # miss its deadline -- so the model is stepped once per hop inside it
-        # rather than assuming one hop per callback.
-        for off in range(0, frames, HOP):
-            main_hop = indata[off : off + HOP, 0].copy()
-            if len(main_hop) < HOP:
-                main_hop = np.pad(main_hop, (0, HOP - len(main_hop)))
+        # Process in chunks of stream_hop
+        for off in range(0, frames, stream_hop):
+            main_hop_in = indata[off : off + stream_hop, 0].copy()
+            if len(main_hop_in) < stream_hop:
+                main_hop_in = np.pad(main_hop_in, (0, stream_hop - len(main_hop_in)))
 
             # Reference mic (channel 1) in dual-mic mode.
-            ref_hop = None
+            ref_hop_in = None
             if dual and indata.shape[1] >= 2:
-                ref_hop = indata[off : off + HOP, 1].copy()
-                if len(ref_hop) < HOP:
-                    ref_hop = np.pad(ref_hop, (0, HOP - len(ref_hop)))
+                ref_hop_in = indata[off : off + stream_hop, 1].copy()
+                if len(ref_hop_in) < stream_hop:
+                    ref_hop_in = np.pad(ref_hop_in, (0, stream_hop - len(ref_hop_in)))
+
+            # Convert 48k to 16k by simple 3x decimation if native_48k is True
+            main_hop = main_hop_in[::3] if native_48k else main_hop_in
+            ref_hop = ref_hop_in[::3] if (native_48k and ref_hop_in is not None) else ref_hop_in
 
             if noise_loop is not None:
                 pos = state["noise_pos"]
@@ -534,7 +539,11 @@ def cmd_live(args) -> None:
             t0 = time.perf_counter()
             out_hop = enhancer.process_hop(main_hop, ref_hop=ref_hop, enabled=state["enabled"])
             state["rtf_samples"].append((time.perf_counter() - t0) / (HOP / SAMPLE_RATE))
-            outdata[off : off + HOP, 0] = out_hop[: min(HOP, frames - off)]
+            
+            # Convert 16k back to 48k by repeating samples
+            out_hop_out = np.repeat(out_hop, 3) if native_48k else out_hop
+            outdata[off : off + stream_hop, 0] = out_hop_out[: min(stream_hop, frames - off)]
+            
             if args.visual:
                 L = enhancer.last
                 state["frame"] = (np.abs(L["spec"]), np.abs(L["spec_out"]), main_hop, out_hop)
@@ -579,10 +588,10 @@ def cmd_live(args) -> None:
     if dev_in is not None or dev_out is not None:
         print(f"input device:  {dev_in if dev_in is not None else 'system default'}")
         print(f"output device: {dev_out if dev_out is not None else 'system default'}")
-    bs = max(HOP, (int(args.blocksize) // HOP) * HOP)
-    if bs != HOP:
-        print(f"block size {bs} samples ({bs / SAMPLE_RATE * 1000:.0f} ms) -- "
-              f"more slack against dropouts, {(bs - HOP) / SAMPLE_RATE * 1000:.0f} ms more latency")
+    bs = max(stream_hop, (int(args.blocksize) // stream_hop) * stream_hop)
+    if bs != stream_hop:
+        print(f"block size {bs} samples ({bs / stream_sr * 1000:.0f} ms) -- "
+              f"more slack against dropouts, {(bs - stream_hop) / stream_sr * 1000:.0f} ms more latency")
 
     # In dual-mic mode we need separate input (2 ch) and output (1 ch) channel
     # counts, so we open an sd.Stream with explicit input/output channels.
@@ -633,6 +642,8 @@ def main():
     parser.add_argument("--visual", action="store_true",
                         help="live terminal spectrogram of input vs model output")
     parser.add_argument("--list-devices", action="store_true", help="print audio devices and exit")
+    parser.add_argument("--native-48k", action="store_true", 
+                        help="Run audio stream natively at 48000Hz (for hardware that rejects 16kHz) and downsample in Python.")
     parser.add_argument("--input-device", metavar="ID|NAME", help="mic to capture from")
     parser.add_argument("--output-device", metavar="ID|NAME", help="where to play the enhanced audio (e.g. BT headphone)")
     parser.add_argument("--process", metavar="FILE", help="enhance a wav file and exit; needs no audio hardware")
