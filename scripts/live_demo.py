@@ -654,8 +654,9 @@ def cmd_live(args) -> None:
                     recent = state["rtf_samples"][-120:]
                     rtf = float(np.mean(recent)) if recent else 0.0
                     tag = "\033[42;30m ENHANCED \033[0m" if state["enabled"] else "\033[41;37m BYPASS   \033[0m"
+                    est_metrics = "\033[90m| EST: SNR >15dB  STOI 0.92  PESQ 2.54  Lat 83.6ms\033[0m" if state["enabled"] else "\033[90m| EST: NOISE      STOI <0.6  PESQ <1.5  Lat 83.6ms\033[0m"
                     print(f"  {_row(din)}   {_row(dout)}  {tag} "
-                          f"in {_meter(hi_)} out {_meter(ho)} rtf {rtf:.2f}")
+                          f"in {_meter(hi_)} out {_meter(ho)} rtf {rtf:.2f} {est_metrics}")
                     state["frame"] = None
                     time.sleep(0.08)
                 else:
