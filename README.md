@@ -1,7 +1,8 @@
 <div align="center">
+
+# Dhwani
   
-# SIH-DRDO: Real-Time AI Speech Enhancement
-  
+## Real-Time AI Speech EnhancementDH
 <img src="docs/logo.png" alt="Balidan Logo" width="200"/>
 
 *A lightweight, real-time AI speech enhancement system built to secure tactical communications in extreme battlefield environments.*
