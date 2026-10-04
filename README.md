@@ -1,13 +1,12 @@
 <div align="center">
 
 # Dhwani
-  
-## Real-Time AI Speech EnhancementDH
 <img src="docs/logo.png" alt="Balidan Logo" width="200"/>
 
 *A lightweight, real-time AI speech enhancement system built to secure tactical communications in extreme battlefield environments.*
 
 </div>
+
 
 ## The Mission
 Military personnel in active combat zones communicate over radio amidst deafening acoustic interference—from impulsive gunfire and artillery to sustained helicopter rotor wash. Traditional noise cancellation relies on predictable frequencies and fails completely on explosive transients. 
