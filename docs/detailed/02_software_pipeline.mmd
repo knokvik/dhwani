@@ -1,0 +1,29 @@
+flowchart TD
+    Raw["Raw 48kHz Audio Frame (Stereo)"] --> Split["Demux Channels"]
+    Split -->|"Channel 1"| Main["Main Mic Buffer (Voice+Noise)"]
+    Split -->|"Channel 0"| Ref["Reference Mic Buffer (Noise)"]
+
+    Main --> DecMain["3x Decimation (16kHz)"]
+    Ref --> DecRef["3x Decimation (16kHz)"]
+
+    DecMain --> STFT_M["STFT (512-pt, 16ms hop) <br> sqrt-Hann Window"]
+    DecRef --> STFT_R["STFT (512-pt, 16ms hop) <br> sqrt-Hann Window"]
+
+    STFT_M --> SpecSub["Boll Spectral Subtraction <br> Pre-stage"]
+    STFT_R -->|"Update Exponential Noise Estimate"| SpecSub
+
+    SpecSub -->|"Pre-cleaned Complex Spectrum"| GTCRN["🧠 GTCRN Neural Network <br> (ONNX Runtime, CPU Provider)"]
+    
+    GTCRN -->|"Complex Ratio Mask"| CleanSpec["Enhanced Complex Spectrum"]
+    CleanSpec --> iSTFT["Inverse STFT & <br> Overlap-Add (OLA)"]
+    
+    iSTFT --> Up["3x Upsampling (48kHz)"]
+    Up --> Paplay["Pipe to paplay subprocess <br> (Raw PCM stream)"]
+    
+    Paplay --> Pulse["PulseAudio/PipeWire"]
+
+    classDef processing fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef ai fill:#e1f5fe,stroke:#0277bd,stroke-width:2px;
+    
+    class GTCRN ai;
+    class SpecSub,STFT_M,STFT_R,iSTFT processing;

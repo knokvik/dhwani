@@ -23,6 +23,8 @@ import termios
 import threading
 import time
 import tty
+import queue
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -388,8 +390,9 @@ def cmd_capture_test(args) -> None:
     def cb(indata, _frames, _time_info, status):
         if status:
             print(status, file=sys.stderr)
-        main_in = indata[:, 0].copy()
-        ref_in = indata[:, 1].copy() if dual else None
+        # Swapped mic channels: Main is now channel 1, Ref is channel 0
+        main_in = indata[:, 1].copy()
+        ref_in = indata[:, 0].copy() if dual else None
         
         main_hop = main_in[::3] if native_48k else main_in
         ref_hop = ref_in[::3] if (native_48k and ref_in is not None) else ref_in
@@ -504,7 +507,7 @@ def cmd_live(args) -> None:
     if dual:
         print("DUAL-MIC MODE: channel 0 = main INMP441, channel 1 = reference INMP441")
         print("output: BT headphone (mono)")
-    state = {"enabled": True, "running": True, "rtf_samples": [], "last_print": time.time(), "noise_pos": 0}
+    state = {"enabled": True, "running": True, "rtf_samples": [], "last_print": time.time(), "noise_pos": 0, "recorded_audio": []}
 
     noise_loop = None
     if args.inject_noise:
@@ -518,25 +521,30 @@ def cmd_live(args) -> None:
     stream_sr = 48000 if native_48k else SAMPLE_RATE
     stream_hop = HOP * 3 if native_48k else HOP
 
-    def callback(indata, outdata, frames, _time_info, status):
+    def callback(indata, frames, _time_info, status):
         if status:
-            print(status, file=sys.stderr)
+            pass # ignore
         # Process in chunks of stream_hop
         for off in range(0, frames, stream_hop):
-            main_hop_in = indata[off : off + stream_hop, 0].copy()
+            # Swapped mic channels: Main is now channel 1, Ref is channel 0
+            main_hop_in = indata[off : off + stream_hop, 1].copy()
             if len(main_hop_in) < stream_hop:
                 main_hop_in = np.pad(main_hop_in, (0, stream_hop - len(main_hop_in)))
 
-            # Reference mic (channel 1) in dual-mic mode.
+            # Reference mic (now channel 0) in dual-mic mode.
             ref_hop_in = None
             if dual and indata.shape[1] >= 2:
-                ref_hop_in = indata[off : off + stream_hop, 1].copy()
+                ref_hop_in = indata[off : off + stream_hop, 0].copy()
                 if len(ref_hop_in) < stream_hop:
                     ref_hop_in = np.pad(ref_hop_in, (0, stream_hop - len(ref_hop_in)))
 
             # Convert 48k to 16k by simple 3x decimation if native_48k is True
             main_hop = main_hop_in[::3] if native_48k else main_hop_in
+            main_hop = main_hop * args.main_gain
+            
             ref_hop = ref_hop_in[::3] if (native_48k and ref_hop_in is not None) else ref_hop_in
+            if ref_hop is not None:
+                ref_hop = ref_hop * args.ref_gain
 
             if noise_loop is not None:
                 pos = state["noise_pos"]
@@ -550,7 +558,13 @@ def cmd_live(args) -> None:
             
             # Convert 16k back to 48k by repeating samples
             out_hop_out = np.repeat(out_hop, 3) if native_48k else out_hop
-            outdata[off : off + stream_hop, 0] = out_hop_out[: min(stream_hop, frames - off)]
+            try:
+                chunk = out_hop_out[: min(stream_hop, frames - off)]
+                audio_queue.put_nowait(chunk)
+                if args.record_live:
+                    state["recorded_audio"].append(chunk.copy())
+            except queue.Full:
+                pass
             
             if args.visual:
                 L = enhancer.last
@@ -587,6 +601,24 @@ def cmd_live(args) -> None:
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
+    audio_queue = queue.Queue(maxsize=50)
+    def playback_thread():
+        cmd = ["paplay", "--format=float32le", "--rate=48000", "--channels=1", "--raw"]
+        player = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        try:
+            while state["running"]:
+                try:
+                    data = audio_queue.get(timeout=0.1)
+                    player.stdin.write(data.tobytes())
+                    player.stdin.flush()
+                except queue.Empty:
+                    continue
+        except Exception:
+            pass
+        finally:
+            player.stdin.close()
+            player.wait()
+
     print("live demo running. press 'e' to toggle enhancement, 'q' to quit.")
     listener = threading.Thread(target=key_listener, daemon=True)
     listener.start()
@@ -603,11 +635,14 @@ def cmd_live(args) -> None:
 
     # In dual-mic mode we need separate input (2 ch) and output (1 ch) channel
     # counts, so we open an sd.Stream with explicit input/output channels.
-    with sd.Stream(samplerate=stream_sr, blocksize=bs,
-                   channels=n_in_channels,   # input channels (1 or 2)
-                   dtype="float32",
-                   device=(dev_in, dev_out) if (dev_in is not None or dev_out is not None) else None,
-                   callback=callback):
+    playback_thread_obj = threading.Thread(target=playback_thread, daemon=True)
+    playback_thread_obj.start()
+
+    with sd.InputStream(samplerate=stream_sr, blocksize=bs,
+                        channels=n_in_channels,   # input channels (1 or 2)
+                        dtype="float32",
+                        device=dev_in if dev_in is not None else None,
+                        callback=callback):
         try:
             if args.visual:
                 _visual_header()
@@ -627,6 +662,13 @@ def cmd_live(args) -> None:
                     time.sleep(0.05)
         except KeyboardInterrupt:
             state["running"] = False
+        finally:
+            state["running"] = False
+            if args.record_live and state["recorded_audio"]:
+                print(f"\nSaving {len(state['recorded_audio'])} frames to {args.record_live}...")
+                import soundfile as sf
+                sf.write(args.record_live, np.concatenate(state["recorded_audio"]), stream_sr)
+                print("Saved!")
 
 
 def main():
@@ -656,9 +698,12 @@ def main():
     parser.add_argument("--output-device", metavar="ID|NAME", help="where to play the enhanced audio (e.g. BT headphone)")
     parser.add_argument("--process", metavar="FILE", help="enhance a wav file and exit; needs no audio hardware")
     parser.add_argument("--out", default="capture_test.wav", help="output wav for --capture-test")
+    parser.add_argument("--record-live", metavar="FILE", help="simultaneously save the output audio to a WAV file during live demo")
     parser.add_argument("--inject-noise", metavar="FILE", help="loop this wav additively into the mic signal (live mode)")
     parser.add_argument("--synthetic-noise", action="store_true", help="inject synthetic pink noise (live mode)")
     parser.add_argument("--noise-gain", type=float, default=0.3, help="linear gain for injected noise")
+    parser.add_argument("--main-gain", type=float, default=1.0, help="Digital multiplier for main mic")
+    parser.add_argument("--ref-gain", type=float, default=1.0, help="Digital multiplier for reference mic")
     # ---- dual INMP441 microphone options ----
     parser.add_argument("--dual-mic", action="store_true",
                         help="dual INMP441 mode: channel 0 = main mic (near mouth), "

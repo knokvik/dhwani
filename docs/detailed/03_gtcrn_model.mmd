@@ -1,0 +1,53 @@
+flowchart TD
+    Input["Complex Spectrum <br> (B, 257, T, 2)"] --> Stack["Stack: [Magnitude, Real, Imaginary]"]
+    Stack --> ERB["ERB Compression Filterbank <br> (257 linear bins → 129 ERB bands)"]
+    ERB --> SFE["Subband Feature Extraction <br> (1x3 Frequency Unfold)"]
+    
+    subgraph Encoder
+        Enc1["ConvBlock 1 <br> (Downsample freq 129→65)"]
+        Enc2["ConvBlock 2 <br> (Downsample freq 65→33)"]
+        Enc3["GTConvBlock <br> (Temporal Dilation d=1)"]
+        Enc4["GTConvBlock <br> (Temporal Dilation d=2)"]
+        Enc5["GTConvBlock <br> (Temporal Dilation d=5)"]
+    end
+    
+    SFE --> Enc1 --> Enc2 --> Enc3 --> Enc4 --> Enc5
+    
+    subgraph RNN["Temporal Modeling"]
+        DPGRNN1["DPGRNN Layer 1 <br> (Intra-RNN + Causal Inter-RNN)"]
+        DPGRNN2["DPGRNN Layer 2 <br> (Intra-RNN + Causal Inter-RNN)"]
+    end
+    
+    Enc5 --> DPGRNN1 --> DPGRNN2
+    
+    subgraph Decoder
+        Dec1["GTConvBlock Deconv <br> (Temporal Dilation d=5)"]
+        Dec2["GTConvBlock Deconv <br> (Temporal Dilation d=2)"]
+        Dec3["GTConvBlock Deconv <br> (Temporal Dilation d=1)"]
+        Dec4["ConvBlock Deconv 1 <br> (Upsample freq 33→65)"]
+        Dec5["ConvBlock Deconv 2 <br> (Upsample freq 65→129)"]
+    end
+    
+    DPGRNN2 --> Dec1 --> Dec2 --> Dec3 --> Dec4 --> Dec5
+    
+    %% Skip Connections
+    Enc4 -.->|"Skip Connection"| Dec2
+    Enc3 -.->|"Skip Connection"| Dec3
+    Enc2 -.->|"Skip Connection"| Dec4
+    Enc1 -.->|"Skip Connection"| Dec5
+    
+    Dec5 --> Mask["Complex Ratio Mask (cRM) <br> [Real Mask, Imag Mask]"]
+    Mask --> iERB["Inverse ERB Filterbank <br> (129 ERB bands → 257 linear bins)"]
+    
+    Input --> Mult(("✖️ Complex <br> Multiplication"))
+    iERB --> Mult
+    
+    Mult --> Output["Enhanced Complex Spectrum <br> (B, 257, T, 2)"]
+    
+    classDef enc fill:#e8eaf6,stroke:#3f51b5,stroke-width:2px;
+    classDef dec fill:#fce4ec,stroke:#e91e63,stroke-width:2px;
+    classDef rnn fill:#e8f5e9,stroke:#4caf50,stroke-width:2px;
+    
+    class Encoder enc;
+    class Decoder dec;
+    class RNN rnn;

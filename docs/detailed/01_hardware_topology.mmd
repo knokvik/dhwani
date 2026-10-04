@@ -1,0 +1,36 @@
+flowchart TD
+    subgraph Environment["Battlefield Acoustic Environment"]
+        Speech["🗣️ Speaker (Voice)"]
+        Noise["💥 Ambient Noise (Gunfire, Vehicle, Heli)"]
+    end
+
+    subgraph Hardware["Raspberry Pi 4 / 5 Hardware Setup"]
+        MainMic["🎤 Main Mic (INMP441) <br> Placed near mouth"]
+        RefMic["🎤 Reference Mic (INMP441) <br> Facing outward"]
+        I2S["I2S Bus (GPIO 18, 19, 20) <br> Time-Division Multiplexed"]
+        CPU["ARM Cortex CPU <br> (Audio processing & AI Inference)"]
+        BT["Bluetooth Transceiver"]
+    end
+
+    Speech -->|"Direct Path"| MainMic
+    Noise -.->|"Attenuated Path"| MainMic
+    Noise -->|"Direct Path"| RefMic
+
+    MainMic -->|"Right Channel (VDD)"| I2S
+    RefMic -->|"Left Channel (GND)"| I2S
+
+    I2S -->|"S32_LE @ 48kHz"| CPU
+    CPU -->|"Clean PCM Audio"| BT
+
+    subgraph Output["User End"]
+        Headset["🎧 Tactical BT Headset"]
+    end
+    BT --> Headset
+
+    classDef env fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef hw fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef out fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    
+    class Environment env;
+    class Hardware hw;
+    class Output out;
